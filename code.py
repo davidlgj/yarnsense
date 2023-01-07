@@ -19,6 +19,7 @@ import displayio
 import terminalio
 import adafruit_displayio_ssd1306
 from adafruit_display_text import label
+from math import sin
 
 #  onboard LED setup
 led = DigitalInOut(board.LED)
@@ -26,29 +27,83 @@ led.direction = Direction.OUTPUT
 led.value = True
 
 # Buzzer
-buzzer = pwmio.PWMOut(board.GP16, frequency=2048, duty_cycle=0)
+speaker = pwmio.PWMOut(board.GP16, frequency=1930, duty_cycle=0, variable_frequency=True)
+speaker.duty_cycle = 0
 
-# When errors occur that we can't come back from. The user can use turn the device off and on again to start over.
+class AxelF:
+    PITCHES = "c,c#,d,d#,e,f,f#,g,g#,a,a#,b".split(",")
+
+    AXEL_F = [
+      ("e5", 4),("g5", 2),("e5", 2),("e5",1), ("a5",2),("e5", 2),("d5", 2),
+      ("e5", 4),("b5", 2),("e5", 2),("e5",1), ("c6",2),("b5", 2),("g5", 2),
+      ("e5", 2),("b5", 2),("e6", 2),("e5",1), ("d5",2),("d5", 1),("b4", 2),("f#5", 2), ("e5", 16)
+    ]
+
+    # This is really not how you do it, but it sounds OK
+    SPEED = 0.008
+
+    def __init__(self, buzzer):
+        self.buzzer = buzzer
+
+    def play_axel(self):
+        self.buzzer.duty_cycle = 2 ** 15
+        for notename, eigths in self.AXEL_F:
+            length = eigths * 0.08
+
+            if notename:
+                self.buzzer.duty_cycle = 2 ** 15
+                self.buzzer.frequency = self.note(notename)
+            else:
+                self.buzzer.duty_cycle = 0
+            time.sleep(length)
+            self.buzzer.duty_cycle = 0
+            time.sleep(self.SPEED)
+        self.buzzer.duty_cycle = 0
+
+    def note(self, name):
+        octave = int(name[-1])
+        pitch = self.PITCHES.index(name[:-1].lower())
+        return int(440 * 2 ** ((octave - 4) + (pitch - 9) / 12.))
+
+class Alarm:
+    def __init__(self, buzzer):
+        self.buzzer = buzzer
+        self.clock = 0
+        self.ringing = False
+        self.cycle = True
+
+    def start(self):
+        print("starting alarm")
+        self.ringing = True
+        self.buzzer.frequency = 1930
+
+    def stop(self):
+        print("stopping alarm")
+        self.ringing = False
+        self.buzzer.duty_cycle = 0
+
+    def tick(self):
+        if self.ringing:
+            t = time.monotonic()
+            if (self.clock + 0.3) < t:
+                # print("alarm ticked")
+                self.clock = t
+                if self.cycle:
+                    self.buzzer.duty_cycle = 2 ** 15
+                    self.cycle = False
+                else:
+                    self.cycle = True
+                    self.buzzer.duty_cycle = 0
+
+
+# When errors occur during initialization
+# that we can't come back from. The user can use turn the device off and on again to start over.
 def hang():
     while True:
-        #buzzer.duty_cycle = 2 ** 15
+        speaker.duty_cycle = 2 ** 15
         time.sleep(0.5)
-        buzzer.duty_cycle = 0
+        speaker.duty_cycle = 0
         time.sleep(3)
-
-# This is for errors when temp is to high and we really want the attention
-def panic():
-    while True:
-        #buzzer.duty_cycle = 2 ** 16 # max volume
-        time.sleep(0.5)
-        buzzer.duty_cycle = 0
-        time.sleep(1)
-
-
-# beep to show we're starting up
-# buzzer.duty_cycle = 2 ** 15
-# time.sleep(0.2)
-# buzzer.duty_cycle = 0
 
 
 class Display:
@@ -90,7 +145,7 @@ class Display:
         self.labels[0].text = t1
         self.labels[1].text = t2
         self.temp_info.text = info
-        print("update temps", self.temp_group.hidden, self.info_group.hidden)
+        # print("update temps", self.temp_group.hidden, self.info_group.hidden)
         if self.temp_group.hidden:
             self.info_group.hidden = True
             self.temp_group.hidden = False
@@ -170,13 +225,8 @@ requests = adafruit_requests.Session(pool, ssl.create_default_context())
 # Target temperature
 # TODO: read stored from flash
 target_temp = float(os.getenv('TARGET_TEMP') or 90)
-current_temp = 0
+warning_temp = float(os.getenv('WARNING_TEMP') or 95)
 # print("Target temp is %s" % target_temp)
-
-# If not None as soon as server loop is done this will be sent as
-# a request to the shelly plug
-request_todo = None # None, "on" or "off"
-
 
 #  font for HTML
 font_family = "monospace"
@@ -187,6 +237,7 @@ class Relay:
         self.ip = ip
         self.is_on = False
         self.enabled = False
+        self.error = False
 
     # state is "on" or "off" since that is what the shelly plug wants
     def send(self,state):
@@ -202,17 +253,20 @@ class Relay:
         # print("-" * 40)
         response.close()
 
+        # If we got this far all is well
+        self.error = False
+
     def check_relay(self):
-        print("Checking if relay is on")
-        print(self.ip)
+        print("Checking if relay is on %s" % self.ip)
         response = requests.get("http://%s/relay/0" % self.ip, timeout=3)
-        print("-" * 40)
+        #print("-" * 40)
         data = response.json()
-        print(data["ison"])
+        #print(data["ison"])
         self.is_on = data["ison"]
-        print("-" * 40)
+        #print("-" * 40)
         response.close()
         self.enabled = True
+        self.error = False
         return self.is_on
 
 
@@ -303,24 +357,40 @@ except OSError:
     display.print("Kunde inte starta web server så jag stänger av mig")
     hang()
 
-
 clock = time.monotonic()
 temp_test = ""
-alarm = False
-info_text = "----------"
+
+overheat_alarm = False
+info_text = "-" * 22
 spinner_count = 0
+
+alarm = Alarm(speaker)
+axel = AxelF(speaker)
+
+# Beep to say that we're up and running
+speaker.duty_cycle = 2 ** 15
+speaker.frequency = axel.note("c5") # Yes ugly
+time.sleep(0.1)
+speaker.frequency = axel.note("g5") # Yes ugly
+time.sleep(0.1)
+speaker.duty_cycle = 0
+speaker.frequency = 1930
+
+warmed_up = [False for x in ds18s]
 
 # main loop
 while True:
     #try:
 
-    # For now we have no reset alarm button, they have to restart it
-    if alarm and (clock + 1) < time.monotonic():
-        if buzzer.duty_cycle == 0:
-            print("alarm")
-            #buzzer.duty_cycle = 2 ** 16 # max volume
-        else:
-            buzzer.duty_cycle = 0
+    # Do we have an alarm of some sorts?
+    do_we_have_panic = overheat_alarm or any(r.error == True for r in relays)
+    if do_we_have_panic and not alarm.ringing:
+        alarm.start()
+        info_text = "Överhettning"
+    elif not do_we_have_panic and alarm.ringing:
+        info_text = "-" * 22
+        alarm.stop()
+    alarm.tick()
 
     #  every 2 seconds update temp reading
     if (clock + 2) < time.monotonic():
@@ -334,7 +404,7 @@ while True:
         # print("Relay 2 is %s" % str(relays[1].is_on))
 
         # Don't overwrite alarm text
-        if not alarm:
+        if not alarm.ringing:
             # Do a small "spinner" so we now it has not just frozen
             info_text = spinner_count * "-" + "*" + (22 - spinner_count) * "-"
             spinner_count += 1
@@ -349,24 +419,35 @@ while True:
             info_text
         )
 
-        for relay, temp in zip(relays, (temp, temp2)):
+        # Update overheat alarm
+        overheat_alarm = temp > warning_temp or temp2 > warning_temp
+        print("overheat?", overheat_alarm, temp2, warning_temp)
+
+        for relay, temp, warm, index in zip(relays, (temp, temp2), warmed_up, range(len(relays))):
             if relay.enabled:
                 try:
                     if temp >= target_temp and relay.is_on:
                         # Target acquired, turn off
                         print("Turning off")
                         relay.send(False)
+
+                        if not warm:
+                            print("warmed up", relay.name)
+                            axel_playing = axel.play_axel()
+                            warmed_up[index] = True
+
                     elif temp < target_temp and not relay.is_on:
                         print("Turning on")
                         relay.send(True)
                 except Exception:
                     print("Failed to contact relay")
-                    alarm = True
+                    alarm.start()
                     info_text = "Relä fel %s" % relay.name
+                    relay.error = True
 
     #  poll the server for incoming/outgoing requests
     server.poll()
-    # pylint: disable=broad-except
+
     # except Exception as e:
     #     print("Exception", e)
     #     continue
